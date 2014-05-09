@@ -1,5 +1,5 @@
-include:
-  - users.sudo
+#include:
+#  - users.sudo
 
 {% for name, user in pillar.get('users', {}).items() if user.absent is not defined or not user.absent %}
 {%- if user == None -%}
