@@ -1,5 +1,29 @@
-#include:
-#  - users.sudo
+# vim: sts=2 ts=2 sw=2 et ai
+{% from "users/map.jinja" import users with context %}
+{% set used_sudo = [] %}
+{% set used_googleauth = [] %}
+
+{%- for name, user in pillar.get('users', {}).items() if user.absent is not defined or not user.absent %}
+{%- if user == None -%}
+{%- set user = {} -%}
+{%- endif -%}
+{%- if 'sudouser' in user and user['sudouser'] %}
+{%- do used_sudo.append(1) %}
+{%- endif %}
+{%- if 'google_auth' in user %}
+{%- do used_googleauth.append(1) %}
+{%- endif %}
+{%- endfor %}
+
+{%- if used_sudo or used_googleauth %}
+include:
+{%- if used_sudo %}
+  - users.sudo
+{%- endif %}
+{%- if used_googleauth %}
+  - users.googleauth
+{%- endif %}
+{%- endif %}
 
 {% for name, user in pillar.get('users', {}).items() if user.absent is not defined or not user.absent %}
 {%- if user == None -%}
@@ -21,14 +45,16 @@
 {% endfor %}
 
 {{ name }}_user:
+  {% if user.get('createhome', True) %}
   file.directory:
     - name: {{ home }}
     - user: {{ name }}
     - group: {{ user_group }}
-    - mode: 0755
+    - mode: {{ user.get('user_dir_mode', '0750') }}
     - require:
       - user: {{ name }}
       - group: {{ user_group }}
+  {%- endif %}
   group.present:
     - name: {{ user_group }}
     {%- if 'prime_group' in user and 'gid' in user['prime_group'] %}
@@ -39,12 +65,12 @@
   user.present:
     - name: {{ name }}
     - home: {{ home }}
-    - shell: {{ user.get('shell', '/bin/bash') }}
+    - shell: {{ user.get('shell', users.get('shell', '/bin/bash')) }}
     {% if 'uid' in user -%}
     - uid: {{ user['uid'] }}
     {% endif -%}
     {% if 'password' in user -%}
-    - password: {{ user['password'] }}
+    - password: '{{ user['password'] }}'
     {% endif -%}
     {% if 'prime_group' in user and 'gid' in user['prime_group'] -%}
     - gid: {{ user['prime_group']['gid'] }}
@@ -54,6 +80,13 @@
     {% if 'fullname' in user %}
     - fullname: {{ user['fullname'] }}
     {% endif -%}
+    {% if not user.get('createhome', True) %}
+    - createhome: False
+    {% endif %}
+    {% if 'expire' in user -%}
+    - expire: {{ user['expire'] }}
+    {% endif -%}
+    - remove_groups: {{ user.get('remove_groups', 'False') }}
     - groups:
       - {{ user_group }}
       {% for group in user.get('groups', []) -%}
@@ -87,6 +120,7 @@ user_{{ name }}_private_key:
     - user: {{ name }}
     - group: {{ user_group }}
     - mode: 600
+    - show_diff: False
     - contents_pillar: users:{{ name }}:ssh_keys:privkey
     - require:
       - user: {{ name }}_user
@@ -99,6 +133,7 @@ user_{{ name }}_public_key:
     - user: {{ name }}
     - group: {{ user_group }}
     - mode: 644
+    - show_diff: False
     - contents_pillar: users:{{ name }}:ssh_keys:pubkey
     - require:
       - user: {{ name }}_user
@@ -120,30 +155,70 @@ ssh_auth_{{ name }}_{{ loop.index0 }}:
 {% endfor %}
 {% endif %}
 
+{% if 'ssh_auth.absent' in user %}
+{% for auth in user['ssh_auth.absent'] %}
+ssh_auth_delete_{{ name }}_{{ loop.index0 }}:
+  ssh_auth.absent:
+    - user: {{ name }}
+    - name: {{ auth }}
+    - require:
+        - file: {{ name }}_user
+        - user: {{ name }}_user
+{% endfor %}
+{% endif %}
 
 {% if 'sudouser' in user and user['sudouser'] %}
+
 sudoer-{{ name }}:
   file.managed:
-    - name: /etc/sudoers.d/{{ name }}
+    - name: {{ users.sudoers_dir }}/{{ name }}
     - user: root
-    - group: root
+    - group: {{ users.root_group }} 
     - mode: '0440'
 {% if 'sudo_rules' in user %}
-/etc/sudoers.d/{{ name }}:
-  file.append:
-    - text:
-      {% for rule in user['sudo_rules'] %}
-      - "{{ name }} {{ rule }}"
-      {% endfor %}
+{% for rule in user['sudo_rules'] %}
+"validate {{ name }} sudo rule {{ loop.index0 }} {{ name }} {{ rule }}":
+  cmd.run:
+    - name: 'visudo -cf - <<<"$rule" | { read output; if [[ $output != "stdin: parsed OK" ]] ; then echo $output ; fi }'
+    - stateful: True
+    - shell: {{ users.visudo_shell }} 
+    - env:
+      # Specify the rule via an env var to avoid shell quoting issues.
+      - rule: "{{ name }} {{ rule }}"
+    - require_in:
+      - file: {{ users.sudoers_dir }}/{{ name }}
+{% endfor %}
+
+{{ users.sudoers_dir }}/{{ name }}:
+  file.managed:
+    - contents: |
+      {%- for rule in user['sudo_rules'] %}
+        {{ name }} {{ rule }}
+      {%- endfor %}
     - require:
       - file: sudoer-defaults
       - file: sudoer-{{ name }}
 {% endif %}
 {% else %}
-/etc/sudoers.d/{{ name }}:
+{{ users.sudoers_dir }}/{{ name }}:
   file.absent:
-    - name: /etc/sudoers.d/{{ name }}
+    - name: {{ users.sudoers_dir }}/{{ name }}
 {% endif %}
+
+{%- if 'google_auth' in user %}
+{%- for svc in user['google_auth'] %}
+googleauth-{{ svc }}-{{ name }}:
+  file.managed:
+    - replace: false
+    - name: {{ users.googleauth_dir }}/{{ name }}_{{ svc }}
+    - contents_pillar: 'users:{{ name }}:google_auth:{{ svc }}'
+    - user: root
+    - group: {{ users.root_group }}
+    - mode: 600
+    - require:
+      - pkg: googleauth-package
+{%- endfor %}
+{%- endif %}
 
 {% endfor %}
 
@@ -160,17 +235,17 @@ sudoer-{{ name }}:
 {% else %}
   user.absent
 {% endif -%}
-/etc/sudoers.d/{{ name }}:
+{{ users.sudoers_dir }}/{{ name }}:
   file.absent:
-    - name: /etc/sudoers.d/{{ name }}
+    - name: {{ users.sudoers_dir }}/{{ name }}
 {% endfor %}
 
 {% for user in pillar.get('absent_users', []) %}
 {{ user }}:
   user.absent
-/etc/sudoers.d/{{ user }}:
+{{ users.sudoers_dir }}/{{ user }}:
   file.absent:
-    - name: /etc/sudoers.d/{{ user }}
+    - name: {{ users.sudoers_dir }}/{{ user }}
 {% endfor %}
 
 {% for group in pillar.get('absent_groups', []) %}
